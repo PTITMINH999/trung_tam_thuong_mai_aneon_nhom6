@@ -1,12 +1,14 @@
 
-# Stage 1: Build Spring Boot
+# Stage 1: Build application
 FROM maven:3.9.11-eclipse-temurin-21 AS build
 
 WORKDIR /app
 
 COPY . .
 
-# Use Maven directly instead of Maven Wrapper
+# Use Google Maven Central mirror
+COPY settings.xml /root/.m2/settings.xml
+
 RUN mvn -B clean package -DskipTests
 
 # Stage 2: Run application
