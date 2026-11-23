@@ -6,8 +6,8 @@ WORKDIR /app
 
 COPY . .
 
-RUN chmod +x mvnw
-RUN ./mvnw -B clean package -DskipTests
+# Use Maven directly instead of Maven Wrapper
+RUN mvn -B clean package -DskipTests
 
 # Stage 2: Run application
 FROM eclipse-temurin:21-jre
