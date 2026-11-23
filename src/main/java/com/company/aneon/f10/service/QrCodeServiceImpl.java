@@ -1,0 +1,377 @@
+package com.company.aneon.f10.service;
+
+
+/**
+ * ==============================================================================
+ * Người code: Bảo
+ * Ngày code: 24/10/2026
+ * Chức năng: Cài đặt nghiệp vụ sinh mã QR token ngẫu nhiên bảo mật, kiểm tra hạn dùng và xử lý lượt check-in của khách
+ * Phiên bản: Version 1
+ * ==============================================================================
+ */
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.HexFormat;
+import java.util.Optional;
+import java.util.UUID;
+
+import com.company.aneon.f10.constant.EventStatus;
+import com.company.aneon.f10.dto.EventDtos;
+import com.company.aneon.f10.entity.LuotThamGiaSuKien;
+import com.company.aneon.f10.entity.MaQrThamGia;
+import com.company.aneon.f10.entity.SuKien;
+import com.company.aneon.f10.integration.CustomerLookupPort;
+import com.company.aneon.f10.integration.PersonLookupPort;
+import com.company.aneon.f10.repository.LuotThamGiaSuKienRepository;
+import com.company.aneon.f10.repository.MaQrThamGiaRepository;
+import com.company.aneon.f10.repository.SuKienRepository;
+import com.company.aneon.shared.error.ApiException;
+import com.company.aneon.shared.error.ErrorCode;
+import com.company.aneon.shared.security.AccessScopePort;
+import com.company.aneon.shared.security.RolePermissions;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * F10UC01.3 + check-in bo tro. BR_SUTI_04: mot QR hieu luc moi su kien
+ * (unique V2), check-in chi trong thoi gian su kien; token chi luu hash
+ * (D0007).
+ * Người phụ trách code: Bảo | Ngày cập nhật local: 2026-11-17 | Phiên bản: v1.1.
+ * Chức năng: phát QR và ghi nhận check-in an toàn theo sự kiện.
+ */
+@Service
+public class QrCodeServiceImpl implements QrCodeService {
+
+    private final SuKienRepository suKienRepository;
+    private final MaQrThamGiaRepository qrRepository;
+    private final LuotThamGiaSuKienRepository attendanceRepository;
+    private final CustomerLookupPort customerLookupPort;
+    private final PersonLookupPort personLookupPort;
+    private final AccessScopePort accessScopePort;
+    private final Clock clock;
+    private final String publicCheckInBaseUrl;
+    private final SecureRandom secureRandom = new SecureRandom();
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Khởi tạo đối tượng QrCodeServiceImpl và cấu hình các thành phần phụ thuộc cần thiết
+     * Phiên bản: Version 1
+     */
+
+    public QrCodeServiceImpl(SuKienRepository suKienRepository, MaQrThamGiaRepository qrRepository,
+                             LuotThamGiaSuKienRepository attendanceRepository,
+                             CustomerLookupPort customerLookupPort, PersonLookupPort personLookupPort,
+                             AccessScopePort accessScopePort, Clock clock,
+                             @Value("${aneon.public-checkin-base-url:}") String publicCheckInBaseUrl) {
+        this.suKienRepository = suKienRepository;
+        this.qrRepository = qrRepository;
+        this.attendanceRepository = attendanceRepository;
+        this.customerLookupPort = customerLookupPort;
+        this.personLookupPort = personLookupPort;
+        this.accessScopePort = accessScopePort;
+        this.clock = clock;
+        this.publicCheckInBaseUrl = publicCheckInBaseUrl;
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Sinh mã QR token bảo mật và đường dẫn check-in sự kiện
+     * Phiên bản: Version 1
+     */
+
+    @Override
+    @Transactional
+    public EventDtos.QrCodeDto generate(UUID eventId) {
+        requirePermission(RolePermissions.F10_EVENT_QR);
+        SuKien event = suKienRepository.findWithLockById(eventId)
+                .orElseThrow(() -> ApiException.notFound("Su kien", eventId));
+        EventAccess.requireInScope(event, accessScopePort);
+        if (publicCheckInBaseUrl == null || publicCheckInBaseUrl.isBlank()) {
+            throw ApiException.dependencyUnavailable(
+                    "Chua cau hinh aneon.public-checkin-base-url cho URL check-in cong khai");
+        }
+        if (event.getStatus() != EventStatus.APPROVED && event.getStatus() != EventStatus.ONGOING) {
+            throw ApiException.conflict("Chi sinh QR cho su kien da duyet va con duoc check-in");
+        }
+        if (event.getEndAt() == null || !Instant.now(clock).isBefore(event.getEndAt())) {
+            throw ApiException.conflict("Su kien da ket thuc, khong the sinh QR");
+        }
+
+        // Flush thu hoi truoc khi INSERT de khong va UNIQUE(event_id, active_guard).
+        var activeCodes = qrRepository.findActiveWithLockByEventId(eventId);
+        if (!activeCodes.isEmpty()) {
+            activeCodes.forEach(qr -> qr.setActive(false));
+            qrRepository.flush();
+        }
+
+        String token = newToken();
+        MaQrThamGia qr = new MaQrThamGia();
+        qr.setId(UUID.randomUUID());
+        qr.setEvent(event);
+        qr.setTokenHash(sha256Hex(token));
+        // URL chua token goc - chi tra cho actor co quyen, khong log (rule 05)
+        qr.setCheckInUrl(publicCheckInBaseUrl + (publicCheckInBaseUrl.contains("?") ? "&" : "?")
+                + "token=" + token + "&event=" + eventId);
+        // expiresAt khong vuot qua endAt su kien (khong noi cua so check-in)
+        qr.setExpiresAt(event.getEndAt());
+        qr.setActive(true);
+        qr.setCreatedBy(requireActor());
+        qrRepository.save(qr);
+        return toDto(qr);
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Truy vấn thông tin active qr theo tiêu chí nghiệp vụ
+     * Phiên bản: Version 1
+     */
+
+    @Override
+    @Transactional(readOnly = true)
+    public Optional<EventDtos.QrCodeDto> getActiveQr(UUID eventId) {
+        SuKien event = findEvent(eventId);
+        EventAccess.requireInScope(event, accessScopePort);
+        return qrRepository.findFirstByEventIdAndActiveTrueOrderByCreatedAtDesc(eventId)
+                .filter(qr -> qr.getExpiresAt() == null || clock.instant().isBefore(qr.getExpiresAt()))
+                .map(this::toDto);
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ status
+     * Phiên bản: Version 1
+     */
+
+    @Override
+    @Transactional(readOnly = true)
+    public EventDtos.CheckInContext status(UUID eventId) {
+        SuKien event = findEvent(eventId);
+        EventAccess.requireInScope(event, accessScopePort);
+        Instant now = clock.instant();
+        var qr = qrRepository.findFirstByEventIdAndActiveTrueOrderByCreatedAtDesc(eventId);
+        return context(event, qr.orElse(null), now);
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ preview
+     * Phiên bản: Version 1
+     */
+
+    @Override
+    @Transactional(readOnly = true)
+    public EventDtos.CheckInContext preview(UUID eventId, String qrToken) {
+        Instant now = clock.instant();
+        MaQrThamGia qr = requireQrToken(eventId, qrToken);
+        return context(findEvent(eventId), qr, now);
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ context
+     * Phiên bản: Version 1
+     */
+
+    private EventDtos.CheckInContext context(SuKien event, MaQrThamGia qr, Instant now) {
+        String state;
+        if (event.getEndAt() == null || !now.isBefore(event.getEndAt())) state = "ENDED";
+        else if (event.getStatus() != EventStatus.APPROVED && event.getStatus() != EventStatus.ONGOING) state = "INACTIVE";
+        else if (qr == null) state = "NO_QR";
+        else if (qr.getExpiresAt() != null && !now.isBefore(qr.getExpiresAt())) state = "EXPIRED";
+        else if (event.getStartAt() != null && now.isBefore(event.getStartAt())) state = "UPCOMING";
+        else state = "READY";
+        return new EventDtos.CheckInContext(event.getName(), event.getStartAt(), event.getEndAt(), state,
+                event.getLocation() == null ? null : event.getLocation().getTextDescription());
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Truy vấn thông tin event theo tiêu chí nghiệp vụ
+     * Phiên bản: Version 1
+     */
+
+    private SuKien findEvent(UUID id) {
+        return suKienRepository.findById(id).filter(event -> event.getArchivedAt() == null)
+                .orElseThrow(() -> ApiException.notFound("Sự kiện", id));
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ require qr token
+     * Phiên bản: Version 1
+     */
+
+    private MaQrThamGia requireQrToken(UUID eventId, String token) {
+        return qrRepository.findByTokenHashAndActiveTrue(sha256Hex(token.trim()))
+                .filter(qr -> eventId.equals(qr.getEvent().getId()))
+                .orElseThrow(() -> ApiException.conflict("Mã QR không hợp lệ hoặc đã được thay thế."));
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Xác thực mã QR và xử lý ghi nhận lượt check-in của khách hàng
+     * Phiên bản: Version 1
+     */
+
+    @Override
+    @Transactional
+    public EventDtos.CheckInResult checkIn(UUID eventId, EventDtos.CheckInRequest request) {
+        SuKien event = findEvent(eventId);
+        UUID actorId = requireActor();
+        UUID customerId = resolveCustomerId(request.customerId(), actorId, event);
+        if (!customerLookupPort.customerExists(customerId)) {
+            throw ApiException.notFound("Khach mua sam", customerId);
+        }
+
+        Instant now = Instant.now(clock);
+        if (event.getStatus() != EventStatus.APPROVED && event.getStatus() != EventStatus.ONGOING) {
+            throw ApiException.conflict("Sự kiện chưa mở check-in.");
+        }
+        if (event.getStartAt() != null && now.isBefore(event.getStartAt())
+                || event.getEndAt() == null || !now.isBefore(event.getEndAt())) {
+            throw ApiException.conflict("Chỉ có thể check-in trong khung giờ diễn ra sự kiện.");
+        }
+
+        MaQrThamGia qr;
+        String rawToken = request.qrToken() == null ? "" : request.qrToken().trim();
+        if (!rawToken.isEmpty() && !rawToken.equalsIgnoreCase("AUTO")) {
+            qr = requireQrToken(eventId, rawToken);
+        } else {
+            requirePermission(RolePermissions.F10_CHECKIN_ASSIST);
+            qr = qrRepository.findFirstByEventIdAndActiveTrueOrderByCreatedAtDesc(eventId)
+                    .orElseThrow(() -> ApiException.conflict("Sự kiện chưa có mã QR hoạt động."));
+        }
+        if (qr.getExpiresAt() != null && !now.isBefore(qr.getExpiresAt())) {
+            throw ApiException.conflict("Mã QR đã hết hạn.");
+        }
+
+        // Replay (quet lai): tra lai luot da co, khong ghi them khong thuong lap.
+        // Canh tranh dong thoi bi UNIQUE chuyen thanh 409 qua GlobalExceptionHandler.
+        var existingEntry = attendanceRepository.findByEventIdAndCustomerId(eventId, customerId);
+        if (existingEntry.isPresent()) {
+            LuotThamGiaSuKien existing = existingEntry.get();
+            return new EventDtos.CheckInResult(existing.getId(), eventId, customerId,
+                    existing.getCheckInAt(), true);
+        }
+
+        LuotThamGiaSuKien entry = new LuotThamGiaSuKien();
+        entry.setId(UUID.randomUUID());
+        entry.setEventId(eventId);
+        entry.setCustomerId(customerId);
+        entry.setQrCodeId(qr.getId());
+        entry.setCheckInAt(now);
+        entry.setScanningDevice(request.scanningDevice());
+        entry.setCreatedBy(actorId);
+        entry.setCreatedAt(now);
+        attendanceRepository.save(entry);
+        return new EventDtos.CheckInResult(entry.getId(), eventId, customerId, entry.getCheckInAt(), false);
+    }
+
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ resolve customer id
+     * Phiên bản: Version 1
+     */
+    private UUID resolveCustomerId(UUID requestedCustomerId, UUID actorId, SuKien event) {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        boolean isCustomer = auth != null && auth.getAuthorities().stream()
+                .anyMatch(a -> "ROLE_CUSTOMER".equals(a.getAuthority()));
+        if (isCustomer && requestedCustomerId == null) {
+            UUID linked = personLookupPort.customerLinkOf(actorId)
+                    .orElseThrow(() -> ApiException.forbidden(
+                            "Tai khoan khach hang chua lien ket khach mua sam"));
+            return linked;
+        }
+        boolean isAssistant = auth != null && auth.getAuthorities().stream()
+                .anyMatch(a -> new SimpleGrantedAuthority(RolePermissions.F10_CHECKIN_ASSIST)
+                        .equals(a));
+        if (isAssistant) {
+            EventAccess.requireInScope(event, accessScopePort);
+            if (requestedCustomerId == null) {
+                throw ApiException.validation("customerId", "Nhan vien ho tro phai chi dinh khach hang");
+            }
+            return requestedCustomerId;
+        }
+        if (requestedCustomerId == null) {
+            throw ApiException.forbidden("Khong co quyen check-in cho khach khac");
+        }
+        if (personLookupPort.customerLinkOf(actorId)
+                .map(linked -> linked.equals(requestedCustomerId)).orElse(false)) {
+            return requestedCustomerId;
+        }
+        throw ApiException.forbidden("Khong co quyen check-in cho khach khac");
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ new token
+     * Phiên bản: Version 1
+     */
+
+    private String newToken() {
+        byte[] bytes = new byte[32];
+        secureRandom.nextBytes(bytes);
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ sha256 hex
+     * Phiên bản: Version 1
+     */
+
+    public static String sha256Hex(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("SHA-256 khong kha dung", ex);
+        }
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ require permission
+     * Phiên bản: Version 1
+     */
+
+    private void requirePermission(String permission) {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getAuthorities().stream()
+                .noneMatch(a -> new SimpleGrantedAuthority(permission).equals(a))) {
+            throw ApiException.forbidden("Khong co quyen thuc hien thao tac nay");
+        }
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Thực hiện xử lý nghiệp vụ require actor
+     * Phiên bản: Version 1
+     */
+
+    private UUID requireActor() {
+        return accessScopePort.currentActorId().orElseThrow(
+                () -> new ApiException(ErrorCode.UNAUTHENTICATED, "Khong xac dinh duoc nguoi thao tac"));
+    }
+    /**
+     * Người code: Bảo
+     * Ngày code: 24/10/2026
+     * Chức năng: Chuyển đổi và ánh xạ dữ liệu giữa Entity và DTO
+     * Phiên bản: Version 1
+     */
+
+    private EventDtos.QrCodeDto toDto(MaQrThamGia qr) {
+        return new EventDtos.QrCodeDto(qr.getId(), qr.getCheckInUrl(), qr.getImageStorageKey(),
+                qr.getExpiresAt(), qr.isActive());
+    }
+}
